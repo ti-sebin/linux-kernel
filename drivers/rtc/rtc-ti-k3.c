@@ -17,6 +17,8 @@
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/rtc.h>
+#include <linux/gpio/driver.h>
+#include <linux/gpio.h>
 
 /* Registers */
 #define REG_K3RTC_S_CNT_LSW		0x08
@@ -136,6 +138,8 @@ static const struct reg_field ti_rtc_reg_fields[] = {
 	[K3RTC_GEN_SW_OFF] = REG_FIELD(REG_K3RTC_GENERAL_CTL, 17, 17),
 };
 
+
+#define TI_K3_RTC_NUM_GPIOS       2
 /**
  * struct k3_rtc_soc_data
  * @has_analog_block:	presence of analog IP block in the subsystem
@@ -157,6 +161,7 @@ struct k3_rtc_soc_data {
  */
 struct ti_k3_rtc {
 	unsigned int irq;
+	struct device *dev;
 	bool has_analog_block;
 	struct mutex mutex_lock;
 	u32 sync_timeout_us;
@@ -164,7 +169,235 @@ struct ti_k3_rtc {
 	struct rtc_device *rtc_dev;
 	struct regmap *regmap;
 	struct regmap_field *r_fields[K3_RTC_MAX_FIELDS];
+	struct gpio_chip gpio_chip;
+	unsigned int num_gpios;
+	struct irq_chip irq_chip;
+	struct irq_domain	*irq_domain;
+	int irq_base;
+	/* IRQ descriptors */
+	// int virq_timer;
+	int virq_gpios[2];
+	/* Spinlock to protect shared registers */
+	spinlock_t lock;
 };
+
+static int ti_k3_rtc_irq_set_type(struct irq_data *data, unsigned int type)
+{
+	struct ti_k3_rtc *priv = irq_data_get_irq_chip_data(data);
+	int gpio = data->hwirq;  // GPIO number (0 or 1 for your 2 GPIOs)
+	
+	dev_dbg(priv->dev, "rtc: Setting IRQ type %x for GPIO %d iqr %d\n", type, gpio, data->irq);
+
+	return 0;
+}
+
+static void ti_k3_rtc_irq_mask(struct irq_data *data)
+{
+ 	struct ti_k3_rtc *priv = irq_data_get_irq_chip_data(data);
+	int gpio = data->hwirq;
+
+	dev_err(priv->dev, "rtc: Disable interrupt for GPIO %d, %d \n", gpio, data->irq);
+}
+
+static void ti_k3_rtc_irq_unmask(struct irq_data *data)
+{
+	struct ti_k3_rtc *priv = irq_data_get_irq_chip_data(data);
+	int gpio = data->hwirq;
+
+	dev_err(priv->dev, "rtc: Enable interrupt for GPIO %d, %d \n", gpio, data->irq);
+
+}
+
+static struct irq_chip ti_k3_rtc_irq_chip = {
+    .name = "ti-k3-rtc-gpio",
+    .irq_set_type = ti_k3_rtc_irq_set_type,
+    .irq_mask = ti_k3_rtc_irq_mask,
+    .irq_unmask = ti_k3_rtc_irq_unmask,
+    .flags = IRQCHIP_SKIP_SET_WAKE,
+};
+
+/* IRQ domain operations */
+static int ti_k3_rtc_irq_domain_map(struct irq_domain *d, unsigned int irq,
+                                  irq_hw_number_t hw)
+{
+	struct ti_k3_rtc *rtc = d->host_data;
+	
+	irq_set_chip_data(irq, rtc);
+	// irq_set_irq_type(irq, IRQ_TYPE_NONE);
+	
+	if (hw < TI_K3_RTC_NUM_GPIOS) {
+	    /* GPIO IRQs */
+	    irq_set_chip_and_handler(irq, &rtc->irq_chip, handle_simple_irq);
+	} else {
+		dev_err(rtc->dev, "rtc: Invalid IRQ %d\n", irq);
+	}
+    	irq_set_noprobe(irq);
+    
+    return 0;
+}
+
+static const struct irq_domain_ops ti_k3_rtc_irq_domain_ops = {
+    .map = ti_k3_rtc_irq_domain_map,
+    .xlate = irq_domain_xlate_onecell,
+};
+
+/* Set up IRQ domain and virtual IRQs */
+static int ti_k3_rtc_setup_irqs(struct platform_device *pdev)
+{
+	int i;
+	int irq_base;
+	struct device *dev = &pdev->dev;
+	struct ti_k3_rtc *rtc = platform_get_drvdata(pdev);
+
+	/* Allocate IRQ descriptors */
+	irq_base = devm_irq_alloc_descs(dev, -1, 0,
+					TI_K3_RTC_NUM_GPIOS, NUMA_NO_NODE);
+	if (irq_base < 0) {
+		dev_err(rtc->dev, "Failed to allocate IRQ descriptors: %d\n", irq_base);
+		return irq_base;
+	}
+
+	rtc->irq_chip = ti_k3_rtc_irq_chip;
+
+	/* Create IRQ domain */
+	rtc->irq_domain = irq_domain_add_legacy(dev->of_node,
+						TI_K3_RTC_NUM_GPIOS, irq_base, 0,
+						&ti_k3_rtc_irq_domain_ops, rtc);
+	if (!rtc->irq_domain) {
+		dev_err(rtc->dev, "Failed to create IRQ domain\n");
+		return -ENOMEM;
+	}
+
+	/* Map GPIO IRQs */
+	for (i = 0; i < TI_K3_RTC_NUM_GPIOS; i++) {
+		rtc->virq_gpios[i] = irq_create_mapping(rtc->irq_domain, i);
+		if (!rtc->virq_gpios[i]) {
+			dev_err(rtc->dev, "Failed to map GPIO IRQ %d\n", i);
+			return -EINVAL;
+		}
+	}
+	
+	// /* Map timer and alarm IRQs */
+	// rtc->virq_timer = irq_create_mapping(rtc->irq_domain, TI_K3_RTC_NUM_GPIOS);
+	// if (!rtc->virq_timer) {
+	// 	dev_err(rtc->dev, "Failed to map timer IRQ\n");
+	// 	return -EINVAL;
+	// }
+
+	return 0;
+}
+
+/* Map GPIO to IRQ */
+static int ti_k3_rtc_gpio_to_irq(struct gpio_chip *chip, unsigned int offset)
+{
+    struct ti_k3_rtc *rtc = gpiochip_get_data(chip);
+    pr_err("GPIO %s for %d \n", __func__, offset);
+    if (offset >= TI_K3_RTC_NUM_GPIOS)
+        return -EINVAL;
+    
+    return rtc->virq_gpios[offset];
+}
+static void ti_k3_rtc_gpio_set(struct gpio_chip *chip, 
+                              unsigned int offset, int value)
+{
+	struct ti_k3_rtc *priv = gpiochip_get_data(chip);
+
+	pr_err("GPIO %s for %d and value %d \n", __func__, offset, value);
+	if (offset >= priv->num_gpios)
+		return;
+
+	// Write GPIO value to RTC registers
+	// Example (you'll need to adjust based on actual registers):
+	// k3rtc_field_write(priv, K3RTC_GPIO_CONTROL + offset, value ? 0x1 : 0x0);
+}
+
+static int ti_k3_rtc_gpio_direction_input(struct gpio_chip *chip, unsigned int offset)
+{
+	struct ti_k3_rtc *priv = gpiochip_get_data(chip);
+
+	pr_err("GPIO %s for %d \n", __func__, offset);
+	if (offset >= priv->num_gpios)
+		return -EINVAL;
+
+	// Configure GPIO as input in RTC registers
+	// You'll need to add the specific register operations here
+
+	return 0;
+}
+
+static int ti_k3_rtc_gpio_direction_output(struct gpio_chip *chip, 
+                                          unsigned int offset, int value)
+{
+	struct ti_k3_rtc *priv = gpiochip_get_data(chip);
+
+	pr_err("GPIO %s for %d \n", __func__, offset);
+	if (offset >= priv->num_gpios)
+		return -EINVAL;
+
+	// Configure GPIO as output in RTC registers
+	// Set the initial value
+
+	return 0;
+}
+
+static int ti_k3_rtc_gpio_get(struct gpio_chip *chip, unsigned int offset)
+{
+	struct ti_k3_rtc *priv = gpiochip_get_data(chip);
+	int value = 0;
+
+	pr_err("GPIO %s for %d \n", __func__, offset);
+	if (offset >= priv->num_gpios)
+		return -EINVAL;
+
+	// Read GPIO value from RTC registers
+	// Example (you'll need to adjust based on actual registers):
+	// value = k3rtc_field_read(priv, K3RTC_GPIO_STATUS + offset) & 0x1;
+
+	return value;
+}
+
+static int ti_k3_rtc_gpio_init(struct ti_k3_rtc *priv, struct device *dev)
+{
+    struct gpio_chip *chip = &priv->gpio_chip;
+    int ret;
+
+    pr_err("GPIO %s\n", __func__);
+    chip->label = dev_name(dev);
+    chip->parent = dev;
+    chip->owner = THIS_MODULE;
+    chip->base = -1; // Request dynamic GPIO base
+    chip->ngpio = 2; // Two GPIOs
+    chip->can_sleep = true;
+
+    // Add GPIO direction control functions
+    chip->direction_input = ti_k3_rtc_gpio_direction_input;
+    chip->direction_output = ti_k3_rtc_gpio_direction_output;
+    chip->get = ti_k3_rtc_gpio_get;
+    chip->set = ti_k3_rtc_gpio_set;
+    chip->to_irq = ti_k3_rtc_gpio_to_irq;
+
+    ret = gpiochip_add_data(chip, priv);
+    if (ret) {
+        dev_err(dev, "Failed to register GPIO chip: %d\n", ret);
+        return ret;
+    }
+
+    priv->num_gpios = chip->ngpio;
+    dev_info(dev, "Registered %d GPIOs\n", priv->num_gpios);
+
+    return 0;
+}
+
+// Add GPIO cleanup in remove function or error path
+static void ti_k3_rtc_remove(struct platform_device *pdev)
+{
+    struct ti_k3_rtc *priv = platform_get_drvdata(pdev);
+    
+    // Remove GPIO chip
+    gpiochip_remove(&priv->gpio_chip);
+    
+    // Existing cleanup code...
+}
 
 static int k3rtc_field_read(struct ti_k3_rtc *priv, enum ti_k3_rtc_fields f)
 {
@@ -675,6 +908,13 @@ static irqreturn_t ti_k3_rtc_interrupt(s32 irq, void *dev_id)
 	/* Notify RTC core on event */
 	rtc_update_irq(priv->rtc_dev, 1, RTC_IRQF | RTC_AF);
 
+	generic_handle_domain_irq(priv->irq_domain, 0);
+	generic_handle_domain_irq(priv->irq_domain, 1);
+//     /* Handle GPIO interrupts */
+//     for (i = 0; i < TI_K3_RTC_NUM_GPIOS; i++) {
+//         if (status & (TI_K3_RTC_INT_GPIO0 << i))
+//             generic_handle_irq(rtc->virq_gpios[i]);
+//     }
 	return IRQ_HANDLED;
 }
 
@@ -825,6 +1065,27 @@ static int k3rtc_get_vbusclk(struct device *dev, struct ti_k3_rtc *priv)
 	return 0;
 }
 
+/* Main IRQ handler */
+static irqreturn_t ti_k3_rtc_irq_handler(int irq, void *dev_id)
+{
+	struct ti_k3_rtc *rtc = dev_id;
+	// u32 status;
+	// unsigned long flags;
+	// int i;    
+
+	pr_err("RTC interrupt %d", irq);
+	generic_handle_irq(rtc->virq_gpios[0]);
+	generic_handle_irq(rtc->virq_gpios[1]);
+    
+//     /* Handle GPIO interrupts */
+//     for (i = 0; i < TI_K3_RTC_NUM_GPIOS; i++) {
+//         if (status & (TI_K3_RTC_INT_GPIO0 << i))
+//             generic_handle_irq(rtc->virq_gpios[i]);
+//     }
+    
+    return IRQ_HANDLED;
+}
+
 static int ti_k3_rtc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -843,6 +1104,7 @@ static int ti_k3_rtc_probe(struct platform_device *pdev)
 	if (!priv)
 		return -ENOMEM;
 
+	priv->dev = dev;
 	priv->has_analog_block = soc_data->has_analog_block;
 	devm_mutex_init(dev, &priv->mutex_lock);
 
@@ -885,16 +1147,33 @@ static int ti_k3_rtc_probe(struct platform_device *pdev)
 	priv->rtc_dev->range_max = (1ULL << 48) - 1;	/* 48Bit seconds */
 	ti_k3_rtc_nvmem_config.priv = priv;
 
+	platform_set_drvdata(pdev, priv);
+
+	/* Set up IRQ domain and virtual IRQs */
+	ret = ti_k3_rtc_setup_irqs(pdev);
+	if (ret)
+		return ret;
+
+	ret = ti_k3_rtc_gpio_init(priv, dev);
+	if (ret)
+		return ret;
+
+	/* Request main IRQ */
+	// ret = devm_request_irq(dev,  priv->irq, ti_k3_rtc_interrupt,
+	// 			0, dev_name(&pdev->dev), priv);
+	// if (ret) {
+	// 	dev_err(&pdev->dev, "Failed to request IRQ: %d\n", ret);
+	// 	return ret;
+	// }
+	// irq_set_chained_handler_and_data(priv->irq, ti_k3_rtc_interrupt, NULL);
 	ret = devm_request_threaded_irq(dev, priv->irq, NULL,
 					ti_k3_rtc_interrupt,
-					IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
+					IRQF_SHARED | IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
 					dev_name(dev), dev);
 	if (ret) {
 		dev_err(dev, "Could not request IRQ: %d\n", ret);
 		return ret;
 	}
-
-	platform_set_drvdata(pdev, priv);
 
 	ret = k3rtc_configure(dev);
 	if (ret)
@@ -1092,6 +1371,7 @@ static SIMPLE_DEV_PM_OPS(ti_k3_rtc_pm_ops, ti_k3_rtc_suspend, ti_k3_rtc_resume);
 
 static struct platform_driver ti_k3_rtc_driver = {
 	.probe = ti_k3_rtc_probe,
+	.remove = ti_k3_rtc_remove,
 	.driver = {
 		   .name = "rtc-ti-k3",
 		   .of_match_table = ti_k3_rtc_of_match_table,

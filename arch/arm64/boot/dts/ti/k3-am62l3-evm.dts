@@ -25,6 +25,26 @@
 		serial3 = &main_uart1;
 	};
 
+	rtc_gpio {
+		compatible = "gpio-keys";
+		//interrupt-parent = <&wkup_rtc0>;
+		//interrupts =<0>;
+		button-rtc0 {
+			label = "rtc_gpio_0";
+			wakeup-source;
+			linux,code = <KEY_WAKEUP>;
+			gpios = <&wkup_rtc0 0 GPIO_ACTIVE_HIGH>;
+			//interrupts = <&wkup_rtc0 0 IRQ_TYPE_LEVEL_HIGH>;
+		};
+		button-rtc1 {
+			label = "rtc_gpio_1";
+			wakeup-source;
+			linux,code = <KEY_WAKEUP>;
+			gpios = <&wkup_rtc0 1 GPIO_ACTIVE_HIGH>;
+			//interrupts = <&wkup_rtc0 1 IRQ_TYPE_NONE>;
+		};
+	};
+
 	chosen {
 		stdout-path = &main_uart0;
 	};
@@ -433,6 +453,15 @@
 		compatible = "atmel,24c512";
 		reg = <0x51>;
 	};
+};
+
+&wkup_rtc0 {
+	status = "okay";
+	/* Enable GPIO functionality */
+	gpio-controller;
+	#gpio-cells = <2>;
+	//interrupt-controller;
+	//#interrupt-cells = <1>;
 };
 
 &main_i2c1 {
